@@ -190,19 +190,6 @@ class LlamaConfig(PretrainedConfig):
             raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -272,7 +259,8 @@ class H2OKVCache_LayerWise:
         _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
         keep_topk = keep_topk.sort().values
 
-        # keep_recent = torch.arange(seq_len - self.recent_size, seq_len).expand(keep_topk.shape[0], 1).to(keep_topk.device)
+        assert num_heads == keep_topk.shape[0]
+
         keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
         keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
 
@@ -315,18 +303,122 @@ class H2OKVCache_LayerWise:
         return (k_hh_recent, v_hh_recent)
 
     def _update_hh_score(self, attn_score_cache):
-
-        num_new_tokens = attn_score_cache.shape[2]
-
         if self.hh_score is None:
             self.hh_score = attn_score_cache.sum(0).sum(1)
         else:
+            num_new_tokens = attn_score_cache.shape[-1] - self.hh_score.shape[-1]
             attn_score_cache = attn_score_cache.sum(0).sum(1)
             attn_score_cache[:, :-num_new_tokens] += self.hh_score
             self.hh_score = attn_score_cache
 
     def _clean_scores(self):
         self.hh_score = None
+
+
+class H2OGroupedKVCache_LayerWise:
+    def __init__(
+        self,
+        hh_size=4,
+        recent_size=512,
+        k_seq_dim=2,
+        v_seq_dim=2,
+    ):
+        self.hh_size = hh_size
+        self.recent_size = recent_size
+        self.cache_size = hh_size + recent_size
+        self.k_seq_dim = k_seq_dim
+        self.v_seq_dim = v_seq_dim
+        self._chunk_size = 32
+        self._chunk_score = None
+        self._keep_idx = None
+
+    def _get_keep_indices(self, attn_score_cache):
+        if self._keep_idx is not None:
+            return
+        if self._chunk_score is None:
+            self._update_score_by_group(attn_score_cache)
+            return
+
+        num_recent_chunks = self.recent_size // self._chunk_size
+        num_hh_chunks = self.hh_size // self._chunk_size
+
+        select_chunk_scores = self._chunk_score[:, :-num_recent_chunks]
+        _, keep_topk = torch.topk(select_chunk_scores, num_hh_chunks - 1, dim=-1)
+        keep_topk = keep_topk.sort().values
+
+        heads, num_chunks = self._chunk_score.shape
+        keep_recent = torch.arange(num_chunks - num_recent_chunks, num_chunks, device=self._chunk_score.device).repeat(heads, 1)
+        keep_group_idx = torch.cat([keep_topk, keep_recent], dim=-1)
+
+        chunked_mask = torch.zeros(self._chunk_score.shape, dtype=torch.bool).to(self._chunk_score.device)
+        chunked_mask = chunked_mask.scatter(-1, keep_group_idx, 1)
+
+        self._chunk_score = self._chunk_score[chunked_mask].view(heads, -1)
+        self._keep_idx = self._convert_chunk_indices(keep_group_idx)
+
+    def _convert_chunk_indices(self, chunk_indices):
+        heads, num_chunks = chunk_indices.shape
+        # Create indices tensor for a single chunk
+        idx = torch.arange(self._chunk_size, device=chunk_indices.device)
+
+        idx = idx.repeat(heads * num_chunks).view(heads, num_chunks, self._chunk_size)
+        expanded_mat = chunk_indices.unsqueeze(2)
+        expanded_mat = expanded_mat.repeat(1, 1, self._chunk_size)
+
+        # Compute indices for each element in the input matrix
+        indices = expanded_mat * self._chunk_size + idx
+        indices = indices.view(heads, num_chunks * self._chunk_size)
+        return indices
+
+    def __call__(self, past_key_values, attn_score_cache):
+        if past_key_values is None:
+            return None
+
+        seq_len = past_key_values[0].size(self.k_seq_dim)
+        if seq_len <= self.cache_size:
+            if seq_len == self.cache_size:
+                self._update_score_by_group(attn_score_cache)
+            return past_key_values
+
+        bsz, num_heads, _, head_dim = past_key_values[0].shape
+
+        self._get_keep_indices(attn_score_cache)
+        mask_shape = (num_heads, seq_len)
+        mask = torch.zeros(mask_shape, dtype=torch.bool).to(past_key_values[0].device)
+        mask = mask.scatter(-1, self._keep_idx, 1)
+
+        k_hh_recent = past_key_values[0].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+        v_hh_recent = past_key_values[1].squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+
+        self._keep_idx = None
+        return (k_hh_recent, v_hh_recent)
+
+    def _update_score_by_group(self, attn_score_cache):
+        num_heads = attn_score_cache.shape[1]
+        if self._chunk_score is None:
+            hh_score = attn_score_cache.sum(0).sum(1)
+
+            _, seq_len = hh_score.shape
+            select_hh_scores = hh_score[:, :-self.recent_size]
+            _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
+            keep_topk = keep_topk.sort().values
+
+            keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=hh_score.device).repeat(num_heads, 1)
+            self._keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
+
+            mask = torch.zeros(hh_score.shape, dtype=torch.bool).to(attn_score_cache.device)
+            mask = mask.scatter(-1, self._keep_idx, 1)
+            self._chunk_score = hh_score[mask].view(num_heads, -1, self._chunk_size).sum(-1)
+        else:
+            num_new_groups = attn_score_cache.shape[-1] // self._chunk_size - self._chunk_score.shape[-1]
+            attn_score_cache = attn_score_cache.sum(0).sum(1)
+            attn_group_score = attn_score_cache.view(num_heads, -1, self._chunk_size).sum(-1)
+            attn_group_score[:, :-num_new_groups] += self._chunk_score
+            self._chunk_score = attn_group_score
+
+    def _clean_scores(self):
+        self._chunk_score = None
+        self._keep_idx = None
 
 
 class H2OLlamaAttention(nn.Module):
