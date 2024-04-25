@@ -56,7 +56,7 @@ if __name__ == '__main__':
     parser.add_argument("--input_path", type=str, default="")
     parser.add_argument("--output_path", type=str, default="")
 
-    parser.add_argument("--model_name", type=str, default="/home/alex/work/optimum-intel/scripts/llama-2-7b-chat/pytorch/")
+    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-2-7b-chat-hf")
     parser.add_argument("--cache_dir", type=str, default=None)
 
     parser.add_argument("--hh_size", type=int, default=1024)
@@ -80,9 +80,11 @@ if __name__ == '__main__':
     args.n_gpu = 0 if args.no_cuda else torch.cuda.device_count()
     set_seed(args)
 
-    model_name = "/home/alex/work/optimum-intel/scripts/llama-2-7b-chat/pytorch" #args.model_name
-    input_path = args.input_path
-    output_path = args.output_path
+    model_name = "meta-llama/Llama-2-7b-chat-hf" #args.model_name # "TinyLlama/TinyLlama-1.1B-Chat-v1.0" #
+    input_path = "data/summarization_data/xsum_val_full.json"
+    # input_path = args.input_path
+    output_path = f"{input_path.split('.')[0]}_result.json"
+    # output_path = args.output_path
 
     #config = AutoConfig.from_pretrained(model_name)#, cache_dir=args.cache_dir)
     config = AutoConfig.from_pretrained(model_name)
@@ -109,9 +111,9 @@ if __name__ == '__main__':
                 requests.append(json.loads(line))
 
     print(len(requests))
-    if args.sample_num < len(requests):
-        print('Sample {} Examples from {} samples'.format(args.sample_num, len(requests)))
-    requests = requests[:args.sample_num]
+    # if args.sample_num < len(requests):
+    #     print('Sample {} Examples from {} samples'.format(args.sample_num, len(requests)))
+    # requests = requests[:args.sample_num]
 
     results = []
     rouge = Rouge()
@@ -126,6 +128,10 @@ if __name__ == '__main__':
             label = request['summary_gt']
             temperature = request['temperature']
             stop = request['stop']
+
+            # to avoid torch.cuda.OutOfMemoryError
+            if len(prompt) > 8000:
+                continue
 
             input_ids = tokenizer(prompt, add_special_tokens=False, return_tensors='pt').input_ids.to(model.device)
 
@@ -176,8 +182,10 @@ if __name__ == '__main__':
             }
             
             results.append(result)
-            print('rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}'.format(np.mean(rouge1_score_list), np.mean(rouge2_score_list), np.mean(rougel_score_list)))
+            if len(results) % 10 == 0:
+                print('rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}'.format(np.mean(rouge1_score_list), np.mean(rouge2_score_list), np.mean(rougel_score_list)))
 
+    print('rouge-1: {:.6f}, rouge-2: {:.6f}, rouge-l: {:.6f}'.format(np.mean(rouge1_score_list), np.mean(rouge2_score_list), np.mean(rougel_score_list)))
     with open(output_path, 'w') as f:
         for result in results:
             f.write(json.dumps(result) + '\n')
